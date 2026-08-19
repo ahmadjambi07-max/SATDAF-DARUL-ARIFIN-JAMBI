@@ -1,0 +1,8 @@
+{
+  "name": "SATDAF \"SISTEM ADMINISTRASI TERPADU DARUL ARIFIN\"",
+  "description": "Sistem informasi terintegrasi untuk pengelolaan data santri, pengasuh, guru, pemetaan kamar asrama, monitoring real-time, dan pelaporan berkala Pondok Pesantren Darul Arifin Jambi.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,19 @@
+{
+  "short_name": "SATDAF",
+  "name": "SATDAF - Sistem Administrasi Terpadu Darul Arifin",
+  "description": "Sistem Informasi & Administrasi Terpadu Pondok Pesantren Darul Arifin Jambi",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "192x192 512x512 any",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#064e3b",
+  "theme_color": "#064e3b",
+  "display": "standalone",
+  "orientation": "portrait",
+  "categories": ["education", "productivity", "management"]
+}

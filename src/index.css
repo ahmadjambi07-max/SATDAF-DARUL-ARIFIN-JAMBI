@@ -1,0 +1,127 @@
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400..900;1,400..900&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Playfair Display", Georgia, Cambria, "Times New Roman", Times, serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  
+  --color-nature-beige: #FAF9F6;
+  --color-nature-charcoal: #2D332F;
+  --color-nature-forest: #2D4034;
+  --color-nature-forest-medium: #3D5245;
+  --color-nature-forest-dark: #26362C;
+  --color-nature-sage: #8A9A5B;
+  --color-nature-gold: #D4AF37;
+  --color-nature-border: #E8E6DF;
+
+  --color-pesantren-emerald-50: #FAF9F6;
+  --color-pesantren-emerald-100: #E8E6DF;
+  --color-pesantren-emerald-200: #DEDCD3;
+  --color-pesantren-emerald-600: #8A9A5B;
+  --color-pesantren-emerald-700: #2D4034;
+  --color-pesantren-emerald-800: #26362C;
+  --color-pesantren-emerald-900: #1F2B23;
+  --color-pesantren-gold-50: #FAF9F6;
+  --color-pesantren-gold-500: #D4AF37;
+  --color-pesantren-gold-600: #C4A02F;
+  --color-pesantren-gold-700: #A38320;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+    font-size: 15px; /* Default desktop base */
+  }
+
+  /* Responsive Font Scaling for Android, Mobile Screens & Installed PWA on Handphones */
+  @media (max-width: 1024px) {
+    html {
+      font-size: 14px;
+    }
+  }
+
+  @media (max-width: 768px) {
+    html {
+      font-size: 13px; /* Compact mobile typography scale */
+      letter-spacing: -0.01em;
+    }
+  }
+
+  @media (max-width: 480px) {
+    html {
+      font-size: 12.5px; /* Extra compact for standard Android smartphones */
+    }
+  }
+
+  /* Mode Khusus PWA Standalone (Aplikasi yang diinstal ke Layar Utama Handphone) */
+  @media all and (display-mode: standalone) {
+    html {
+      font-size: 12.5px;
+    }
+    @media (max-width: 480px) {
+      html {
+        font-size: 12px; /* Super compact & dense native Android app feel */
+      }
+    }
+  }
+
+  body {
+    @apply font-sans bg-nature-beige text-nature-charcoal antialiased selection:bg-nature-sage/20 selection:text-nature-forest overflow-x-hidden;
+    touch-action: manipulation;
+  }
+
+  button, a, select, input, textarea {
+    touch-action: manipulation;
+  }
+
+  /* Form controls font size on mobile */
+  @media (max-width: 640px) {
+    input[type="text"],
+    input[type="number"],
+    input[type="password"],
+    input[type="email"],
+    input[type="date"],
+    select,
+    textarea {
+      font-size: 13.5px !important;
+    }
+  }
+}
+
+/* Custom utility for hiding scrollbars while keeping touch scrolling functional */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Custom sleek scrollbar for smooth mobile/desktop navigation */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(232, 230, 223, 0.4);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(45, 64, 52, 0.25);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(45, 64, 52, 0.5);
+}
+
+/* Custom styles for glowing indicator animation */
+@keyframes pulse-slow {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .4; transform: scale(1.1); }
+}
+
+.animate-pulse-slow {
+  animation: pulse-slow 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
