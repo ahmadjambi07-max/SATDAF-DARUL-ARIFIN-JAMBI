@@ -1,30 +1,20 @@
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { 
-  getFirestore, 
-  initializeFirestore,
-  persistentLocalCache,
-  persistentMultipleTabManager,
-  CACHE_SIZE_UNLIMITED,
-  collection, 
-  doc, 
-  setDoc, 
-  deleteDoc, 
-  onSnapshot, 
-  getDocs, 
-  writeBatch,
-  query,
-  orderBy,
-  getDoc
-} from 'firebase/firestore';
-import { 
-  Santri, 
-  PengasuhGuru, 
-  Kamar, 
-  LogAktivitas, 
-  CatatanKeuangan, 
-  PelanggaranSantri, 
-  Prestasi, 
-  TargetMasterItem, 
+/**
+ * Lapisan penyimpanan SATDAF.
+ *
+ * Data sekarang disimpan di PostgreSQL milik sendiri (bukan Firebase/Firestore),
+ * lewat API internal `/api/collections/...` di server Express. Semua fungsi yang
+ * diekspor dipertahankan dengan nama dan tanda tangan yang sama seperti sebelumnya,
+ * jadi komponen aplikasi tidak perlu berubah.
+ */
+import type {
+  Santri,
+  PengasuhGuru,
+  Kamar,
+  LogAktivitas,
+  CatatanKeuangan,
+  PelanggaranSantri,
+  Prestasi,
+  TargetMasterItem,
   RecordMutabaahSantri,
   KunjunganBerobat,
   StokObatLogistik,
@@ -34,77 +24,107 @@ import {
   KaryawanSDM,
   PenilaianKinerjaSDM,
   ProgramInovasiLitbang,
-  RecordSetoranTahfidz
+  RecordSetoranTahfidz,
 } from './types';
 import { DEFAULT_TARGET_MASTERS } from './data/mockMutabaah';
 import { DEFAULT_TAHFIDZ_SETORAN } from './data/mockTahfidzGamifikasi';
 
-const firebaseConfig = {
-  apiKey: "AIzaSyDw3l5DZ1uWWI0GvOgJ6ORXIxUeq7YBQ3w",
-  authDomain: "dulcet-day-2s7sz.firebaseapp.com",
-  projectId: "dulcet-day-2s7sz",
-  storageBucket: "dulcet-day-2s7sz.firebasestorage.app",
-  messagingSenderId: "620463839495",
-  appId: "1:620463839495:web:3d4d0fd5d675bf4273cda2"
-};
+const API = '/api';
 
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const databaseId = "ai-studio-satdafsistemadmi-0afc1d6c-be3f-4056-a560-9b01eb2d1255";
-
-// Initialize Firestore with IndexedDB Offline Persistence and Multi-Tab Synchronization
-let firestoreInstance;
-try {
-  firestoreInstance = initializeFirestore(app, {
-    localCache: persistentLocalCache({
-      tabManager: persistentMultipleTabManager(),
-      cacheSizeBytes: CACHE_SIZE_UNLIMITED
-    })
-  }, databaseId);
-  console.log("✅ Firestore Offline Caching (IndexedDB Persistence) aktif dan siap digunakan.");
-} catch (e) {
-  console.warn("⚠️ Fallback to standard Firestore instance:", e);
-  firestoreInstance = getFirestore(app, databaseId);
-}
-
-export const db = firestoreInstance;
-
-// Helper to strip undefined values so Firestore does not throw invalid data errors
 function cleanData<T>(item: T): T {
   return JSON.parse(JSON.stringify(item));
 }
 
-// Global Quota & Offline Status Tracker
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API}${path}`, {
+    headers: { 'Content-Type': 'application/json' },
+    ...init,
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(detail || `Permintaan ${path} gagal (${response.status})`);
+  }
+  if (response.status === 204) return undefined as T;
+  return (await response.json()) as T;
+}
+
+const listDocs = <T>(collection: string) => request<T[]>(`/collections/${collection}`);
+
+const saveDoc = (collection: string, item: Record<string, any>) =>
+  request(`/collections/${collection}/${encodeURIComponent(String(item.id))}`, {
+    method: 'PUT',
+    body: JSON.stringify(cleanData(item)),
+  });
+
+const deleteDocById = (collection: string, id: string) =>
+  request(`/collections/${collection}/${encodeURIComponent(id)}`, { method: 'DELETE' });
+
+const clearCollection = (collection: string) =>
+  request(`/collections/${collection}`, { method: 'DELETE' });
+
+const saveMany = (collection: string, items: { id: string }[]) =>
+  request(`/collections/${collection}/batch`, {
+    method: 'POST',
+    body: JSON.stringify({ items: items.map(cleanData) }),
+  });
+
+async function getSystemDoc(id: string): Promise<Record<string, unknown> | undefined> {
+  const docs = await listDocs<Record<string, unknown>>('system');
+  return docs.find((doc) => doc && doc.id === id);
+}
+
+/**
+ * Berlangganan realtime satu koleksi. Menggantikan Firestore onSnapshot:
+ * server mengirim ulang seluruh daftar setiap ada perubahan.
+ */
+function subscribe<T>(
+  collection: string,
+  onUpdate: (list: T[]) => void,
+  compare?: (a: T, b: T) => number
+) {
+  const apply = (raw: T[]) => {
+    const items = Array.isArray(raw) ? [...raw] : [];
+    if (compare) items.sort(compare);
+    onUpdate(items);
+  };
+
+  const source = new EventSource(`${API}/collections/${collection}/events`);
+  source.onmessage = (event) => {
+    try {
+      apply(JSON.parse(event.data) as T[]);
+    } catch (err) {
+      console.error(`Error inside subscribe ${collection}:`, err);
+    }
+  };
+  source.onerror = () => {
+    console.warn(`Koneksi realtime '${collection}' terputus, menyambung ulang otomatis...`);
+  };
+
+  return () => source.close();
+}
+
+// ---------------------------------------------------------------------------
+// STATUS KUOTA (tidak berlaku lagi untuk PostgreSQL, dipertahankan agar kompatibel)
+// ---------------------------------------------------------------------------
 type QuotaListener = (exceeded: boolean) => void;
-const quotaListeners = new Set<QuotaListener>();
 export let isQuotaExceededState = false;
 
 export function onQuotaExceededChange(listener: QuotaListener) {
-  quotaListeners.add(listener);
   listener(isQuotaExceededState);
-  return () => quotaListeners.delete(listener);
+  return () => {};
 }
 
 export function markQuotaExceeded() {
-  if (!isQuotaExceededState) {
-    isQuotaExceededState = true;
-    quotaListeners.forEach(fn => {
-      try { fn(true); } catch (e) { console.error(e); }
-    });
-  }
+  // PostgreSQL milik sendiri: tidak ada kuota harian.
 }
 
-export function checkIsQuotaError(err: unknown): boolean {
-  if (!err) return false;
-  const msg = err instanceof Error ? err.message : String(err);
-  return (
-    msg.includes('Quota limit exceeded') || 
-    msg.includes('resource-exhausted') || 
-    msg.includes('Quota exceeded') ||
-    msg.includes('Free daily read units per project')
-  );
+export function checkIsQuotaError(_err?: unknown) {
+  return false;
 }
 
-// One-time Database Bootstrapper using system document indicator
+// ---------------------------------------------------------------------------
+// BOOTSTRAP DATA AWAL
+// ---------------------------------------------------------------------------
 export async function bootstrapDatabaseIfEmpty(
   defaultSantri: Santri[],
   defaultGuru: PengasuhGuru[],
@@ -114,1073 +134,555 @@ export async function bootstrapDatabaseIfEmpty(
   defaultPelanggaran: PelanggaranSantri[],
   defaultPrestasi?: Prestasi[]
 ) {
-  if (isQuotaExceededState) return;
   try {
-    const statusRef = doc(db, 'system', 'bootstrap');
-    const statusSnap = await getDoc(statusRef);
-    
-    if (!statusSnap.exists()) {
-      console.log("Initializing database with default pesantren data...");
-      
-      // We will perform a series of batch writes to write the default data.
-      // 1. Santri
-      if (defaultSantri && defaultSantri.length > 0) {
-        const santriBatch = writeBatch(db);
-        defaultSantri.forEach(item => {
-          santriBatch.set(doc(db, 'santri', item.id), cleanData(item));
-        });
-        await santriBatch.commit();
-      }
-      
-      // 2. Guru
-      if (defaultGuru && defaultGuru.length > 0) {
-        const guruBatch = writeBatch(db);
-        defaultGuru.forEach(item => {
-          guruBatch.set(doc(db, 'guru', item.id), cleanData(item));
-        });
-        await guruBatch.commit();
-      }
-      
-      // 3. Kamar
-      if (defaultKamar && defaultKamar.length > 0) {
-        const kamarBatch = writeBatch(db);
-        defaultKamar.forEach(item => {
-          kamarBatch.set(doc(db, 'kamar', item.id), cleanData(item));
-        });
-        await kamarBatch.commit();
-      }
-      
-      // 4. Logs
-      if (defaultLogs && defaultLogs.length > 0) {
-        const logsBatch = writeBatch(db);
-        defaultLogs.forEach(item => {
-          logsBatch.set(doc(db, 'logs', item.id), cleanData(item));
-        });
-        await logsBatch.commit();
-      }
-      
-      // 5. Keuangan
-      if (defaultKeuangan && defaultKeuangan.length > 0) {
-        const keuanganBatch = writeBatch(db);
-        defaultKeuangan.forEach(item => {
-          keuanganBatch.set(doc(db, 'keuangan', item.id), cleanData(item));
-        });
-        await keuanganBatch.commit();
-      }
-      
-      // 6. Pelanggaran
-      if (defaultPelanggaran && defaultPelanggaran.length > 0) {
-        const pelanggaranBatch = writeBatch(db);
-        defaultPelanggaran.forEach(item => {
-          pelanggaranBatch.set(doc(db, 'pelanggaran', item.id), cleanData(item));
-        });
-        await pelanggaranBatch.commit();
-      }
+    const status = await getSystemDoc('bootstrap');
+    if (status) {
+      console.log('Database sudah terinisialisasi, bootstrap dilewati.');
+      return;
+    }
 
-      // 7. Prestasi
-      if (defaultPrestasi && defaultPrestasi.length > 0) {
-        const prestasiBatch = writeBatch(db);
-        defaultPrestasi.forEach(item => {
-          prestasiBatch.set(doc(db, 'prestasi', item.id), cleanData(item));
-        });
-        await prestasiBatch.commit();
-      }
-      
-      // Mark system as bootstrapped
-      await setDoc(statusRef, { initialized: true });
-      console.log("Database initialization successful!");
-    } else {
-      console.log("Database already initialized, skipping bootstrap.");
-    }
+    console.log('Mengisi database dengan data pesantren awal...');
+    if (defaultSantri?.length) await saveMany('santri', defaultSantri);
+    if (defaultGuru?.length) await saveMany('guru', defaultGuru);
+    if (defaultKamar?.length) await saveMany('kamar', defaultKamar);
+    if (defaultLogs?.length) await saveMany('logs', defaultLogs);
+    if (defaultKeuangan?.length) await saveMany('keuangan', defaultKeuangan);
+    if (defaultPelanggaran?.length) await saveMany('pelanggaran', defaultPelanggaran);
+    if (defaultPrestasi?.length) await saveMany('prestasi', defaultPrestasi);
+
+    await saveDoc('system', { id: 'bootstrap', initialized: true });
+    console.log('Bootstrap database berhasil.');
   } catch (err) {
-    if (checkIsQuotaError(err)) {
-      markQuotaExceeded();
-    }
-    console.warn("Database bootstrap skipped / quota limit:", err);
+    console.warn('Bootstrap database dilewati:', err);
   }
 }
 
-// 1. Subscribe without automatic empty check & bootstrap
-export function subscribeSantri(
-  onUpdate: (list: Santri[]) => void
-) {
-  const colRef = collection(db, 'santri');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: Santri[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as Santri);
-        });
-        // Sort alphabetically by name
-        items.sort((a, b) => a.nama.localeCompare(b.nama));
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeSantri:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) {
-        markQuotaExceeded();
-      }
-      console.warn("Firestore onSnapshot 'santri' listener notice:", error?.message || error);
-    }
+// ---------------------------------------------------------------------------
+// DATA INDUK: SANTRI, GURU, KAMAR
+// ---------------------------------------------------------------------------
+export function subscribeSantri(onUpdate: (list: Santri[]) => void) {
+  return subscribe<Santri>('santri', onUpdate, (a, b) => a.nama.localeCompare(b.nama));
+}
+
+export function subscribeGuru(onUpdate: (list: PengasuhGuru[]) => void) {
+  return subscribe<PengasuhGuru>('guru', onUpdate, (a, b) => a.nama.localeCompare(b.nama));
+}
+
+export function subscribeKamar(onUpdate: (list: Kamar[]) => void) {
+  return subscribe<Kamar>('kamar', onUpdate, (a, b) => a.namaKamar.localeCompare(b.namaKamar));
+}
+
+export function subscribeLogs(onUpdate: (list: LogAktivitas[]) => void) {
+  return subscribe<LogAktivitas>(
+    'logs',
+    onUpdate,
+    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
   );
 }
 
-export function subscribeGuru(
-  onUpdate: (list: PengasuhGuru[]) => void
-) {
-  const colRef = collection(db, 'guru');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: PengasuhGuru[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as PengasuhGuru);
-        });
-        items.sort((a, b) => a.nama.localeCompare(b.nama));
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeGuru:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) {
-        markQuotaExceeded();
-      }
-      console.warn("Firestore onSnapshot 'guru' listener notice:", error?.message || error);
-    }
+export function subscribeKeuangan(onUpdate: (list: CatatanKeuangan[]) => void) {
+  return subscribe<CatatanKeuangan>('keuangan', onUpdate, (a, b) =>
+    b.tanggal.localeCompare(a.tanggal)
   );
 }
 
-export function subscribeKamar(
-  onUpdate: (list: Kamar[]) => void
-) {
-  const colRef = collection(db, 'kamar');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: Kamar[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as Kamar);
-        });
-        items.sort((a, b) => a.namaKamar.localeCompare(b.namaKamar));
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeKamar:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) {
-        markQuotaExceeded();
-      }
-      console.warn("Firestore onSnapshot 'kamar' listener notice:", error?.message || error);
-    }
+export function subscribePelanggaran(onUpdate: (list: PelanggaranSantri[]) => void) {
+  return subscribe<PelanggaranSantri>('pelanggaran', onUpdate, (a, b) =>
+    b.tanggal.localeCompare(a.tanggal)
   );
 }
 
-export function subscribeLogs(
-  onUpdate: (list: LogAktivitas[]) => void
-) {
-  const colRef = collection(db, 'logs');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: LogAktivitas[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as LogAktivitas);
-        });
-        // Sort newest first
-        items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeLogs:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) {
-        markQuotaExceeded();
-      }
-      console.warn("Firestore onSnapshot 'logs' listener notice:", error?.message || error);
-    }
+export function subscribePrestasi(onUpdate: (list: Prestasi[]) => void) {
+  return subscribe<Prestasi>('prestasi', onUpdate, (a, b) => b.tanggal.localeCompare(a.tanggal));
+}
+
+export function subscribeMutabaahTargets(onUpdate: (list: TargetMasterItem[]) => void) {
+  return subscribe<TargetMasterItem>('mutabaah_targets', onUpdate);
+}
+
+export function subscribeMutabaahRecords(onUpdate: (list: RecordMutabaahSantri[]) => void) {
+  return subscribe<RecordMutabaahSantri>('mutabaah_records', onUpdate, (a, b) =>
+    b.tanggal.localeCompare(a.tanggal)
   );
 }
 
-export function subscribeKeuangan(
-  onUpdate: (list: CatatanKeuangan[]) => void
-) {
-  const colRef = collection(db, 'keuangan');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: CatatanKeuangan[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as CatatanKeuangan);
-        });
-        // Sort by date newest first
-        items.sort((a, b) => b.tanggal.localeCompare(a.tanggal));
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeKeuangan:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) {
-        markQuotaExceeded();
-      }
-      console.warn("Firestore onSnapshot 'keuangan' listener notice:", error?.message || error);
-    }
-  );
-}
-
-export function subscribePelanggaran(
-  onUpdate: (list: PelanggaranSantri[]) => void
-) {
-  const colRef = collection(db, 'pelanggaran');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: PelanggaranSantri[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as PelanggaranSantri);
-        });
-        // Sort by date newest first
-        items.sort((a, b) => b.tanggal.localeCompare(a.tanggal));
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribePelanggaran:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) {
-        markQuotaExceeded();
-      }
-      console.warn("Firestore onSnapshot 'pelanggaran' listener notice:", error?.message || error);
-    }
-  );
-}
-
-export function subscribePrestasi(
-  onUpdate: (list: Prestasi[]) => void
-) {
-  const colRef = collection(db, 'prestasi');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: Prestasi[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as Prestasi);
-        });
-        // Sort by date newest first
-        items.sort((a, b) => b.tanggal.localeCompare(a.tanggal));
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribePrestasi:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) {
-        markQuotaExceeded();
-      }
-      console.warn("Firestore onSnapshot 'prestasi' listener notice:", error?.message || error);
-    }
-  );
-}
-
-export function subscribeMutabaahTargets(
-  onUpdate: (list: TargetMasterItem[]) => void
-) {
-  const colRef = collection(db, 'mutabaah_targets');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: TargetMasterItem[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as TargetMasterItem);
-        });
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeMutabaahTargets:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) {
-        markQuotaExceeded();
-      }
-      console.warn("Firestore onSnapshot 'mutabaah_targets' listener notice:", error?.message || error);
-    }
-  );
-}
-
-export function subscribeMutabaahRecords(
-  onUpdate: (list: RecordMutabaahSantri[]) => void
-) {
-  const colRef = collection(db, 'mutabaah_records');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: RecordMutabaahSantri[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as RecordMutabaahSantri);
-        });
-        items.sort((a, b) => b.tanggal.localeCompare(a.tanggal));
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeMutabaahRecords:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) {
-        markQuotaExceeded();
-      }
-      console.warn("Firestore onSnapshot 'mutabaah_records' listener notice:", error?.message || error);
-    }
-  );
-}
-
-// 2. Mutations
 export async function saveSantriDoc(item: Santri) {
   try {
-    await setDoc(doc(db, 'santri', item.id), cleanData(item));
+    await saveDoc('santri', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Santri doc:", err);
+    console.error('Error saving Santri doc:', err);
     throw err;
   }
 }
 
 export async function deleteSantriDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'santri', id));
+    await deleteDocById('santri', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting Santri doc:", err);
+    console.error('Error deleting Santri doc:', err);
     throw err;
   }
 }
 
 export async function saveGuruDoc(item: PengasuhGuru) {
   try {
-    await setDoc(doc(db, 'guru', item.id), cleanData(item));
+    await saveDoc('guru', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Guru doc:", err);
+    console.error('Error saving Guru doc:', err);
     throw err;
   }
 }
 
 export async function deleteGuruDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'guru', id));
+    await deleteDocById('guru', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting Guru doc:", err);
+    console.error('Error deleting Guru doc:', err);
     throw err;
   }
 }
 
 export async function savePrestasiDoc(item: Prestasi) {
   try {
-    await setDoc(doc(db, 'prestasi', item.id), cleanData(item));
+    await saveDoc('prestasi', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Prestasi doc:", err);
+    console.error('Error saving Prestasi doc:', err);
     throw err;
   }
 }
 
 export async function deletePrestasiDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'prestasi', id));
+    await deleteDocById('prestasi', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting Prestasi doc:", err);
+    console.error('Error deleting Prestasi doc:', err);
     throw err;
   }
 }
 
 export async function saveKamarDoc(item: Kamar) {
   try {
-    await setDoc(doc(db, 'kamar', item.id), cleanData(item));
+    await saveDoc('kamar', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Kamar doc:", err);
+    console.error('Error saving Kamar doc:', err);
     throw err;
   }
 }
 
 export async function deleteKamarDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'kamar', id));
+    await deleteDocById('kamar', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting Kamar doc:", err);
+    console.error('Error deleting Kamar doc:', err);
     throw err;
   }
 }
 
 export async function saveLogsDoc(item: LogAktivitas) {
   try {
-    await setDoc(doc(db, 'logs', item.id), cleanData(item));
+    await saveDoc('logs', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Log doc:", err);
+    console.error('Error saving Log doc:', err);
     throw err;
   }
 }
 
 export async function saveKeuanganDoc(item: CatatanKeuangan) {
   try {
-    await setDoc(doc(db, 'keuangan', item.id), cleanData(item));
+    await saveDoc('keuangan', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Keuangan doc:", err);
+    console.error('Error saving Keuangan doc:', err);
     throw err;
   }
 }
 
 export async function deleteKeuanganDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'keuangan', id));
+    await deleteDocById('keuangan', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting Keuangan doc:", err);
+    console.error('Error deleting Keuangan doc:', err);
     throw err;
   }
 }
 
 export async function savePelanggaranDoc(item: PelanggaranSantri) {
   try {
-    await setDoc(doc(db, 'pelanggaran', item.id), cleanData(item));
+    await saveDoc('pelanggaran', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Pelanggaran doc:", err);
+    console.error('Error saving Pelanggaran doc:', err);
     throw err;
   }
 }
 
 export async function deletePelanggaranDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'pelanggaran', id));
+    await deleteDocById('pelanggaran', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting Pelanggaran doc:", err);
+    console.error('Error deleting Pelanggaran doc:', err);
     throw err;
   }
 }
 
+// ---------------------------------------------------------------------------
+// MUTABAAH YAUMIYAH
+// ---------------------------------------------------------------------------
 export async function saveMutabaahTargetDoc(item: TargetMasterItem) {
   try {
-    await setDoc(doc(db, 'mutabaah_targets', item.id), cleanData(item));
+    await saveDoc('mutabaah_targets', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Mutabaah Target doc:", err);
+    console.error('Error saving Mutabaah Target doc:', err);
     throw err;
   }
 }
 
 export async function deleteMutabaahTargetDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'mutabaah_targets', id));
+    await deleteDocById('mutabaah_targets', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting Mutabaah Target doc:", err);
+    console.error('Error deleting Mutabaah Target doc:', err);
     throw err;
   }
 }
 
 export async function resetMutabaahTargetsInDb() {
-  if (isQuotaExceededState) return;
   try {
-    const colRef = collection(db, 'mutabaah_targets');
-    const snapshot = await getDocs(colRef);
-    const batch = writeBatch(db);
-    snapshot.forEach((d) => {
-      batch.delete(d.ref);
-    });
-    DEFAULT_TARGET_MASTERS.forEach((item) => {
-      batch.set(doc(db, 'mutabaah_targets', item.id), cleanData(item));
-    });
-    await batch.commit();
-    console.log("Successfully reset mutabaah_targets in Firestore to default 33 items.");
+    await clearCollection('mutabaah_targets');
+    await saveMany('mutabaah_targets', DEFAULT_TARGET_MASTERS);
+    console.log('mutabaah_targets berhasil direset ke 33 item default.');
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error resetting mutabaah_targets:", err);
+    console.error('Error resetting mutabaah_targets:', err);
     throw err;
   }
 }
 
 export async function ensureMutabaahTargets33Once() {
-  if (isQuotaExceededState) return;
   try {
-    const colRef = collection(db, 'mutabaah_targets');
-    const snapshot = await getDocs(colRef);
-    if (snapshot.empty || snapshot.size < 33) {
-      console.log(`mutabaah_targets has ${snapshot.size} items (< 33). Seeding 33 default target items...`);
+    const items = await listDocs('mutabaah_targets');
+    if (items.length < 33) {
+      console.log(`mutabaah_targets berisi ${items.length} item (< 33). Mengisi 33 target default...`);
       await resetMutabaahTargetsInDb();
     }
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.warn("Notice: ensureMutabaahTargets33Once skipped / quota limit:", err);
+    console.warn('ensureMutabaahTargets33Once dilewati:', err);
   }
 }
 
 export async function saveMutabaahRecordDoc(item: RecordMutabaahSantri) {
   try {
-    await setDoc(doc(db, 'mutabaah_records', item.id), cleanData(item));
+    await saveDoc('mutabaah_records', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Mutabaah Record doc:", err);
+    console.error('Error saving Mutabaah Record doc:', err);
     throw err;
   }
 }
 
 export async function batchSaveMutabaahRecords(records: RecordMutabaahSantri[]) {
   try {
-    const batch = writeBatch(db);
-    records.forEach(r => {
-      batch.set(doc(db, 'mutabaah_records', r.id), cleanData(r));
-    });
-    await batch.commit();
+    await saveMany('mutabaah_records', records);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error in batchSaveMutabaahRecords:", err);
+    console.error('Error in batchSaveMutabaahRecords:', err);
     throw err;
   }
 }
 
 export async function deleteMutabaahRecordDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'mutabaah_records', id));
+    await deleteDocById('mutabaah_records', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting Mutabaah Record doc:", err);
+    console.error('Error deleting Mutabaah Record doc:', err);
     throw err;
   }
 }
 
 // ---------------------------------------------------------------------------
-// KLINIK KESEHATAN FIRESTORE SUBSCRIPTIONS & MUTATIONS
+// KLINIK KESEHATAN
 // ---------------------------------------------------------------------------
-
-export function subscribeKunjunganBerobat(
-  onUpdate: (list: KunjunganBerobat[]) => void
-) {
-  const colRef = collection(db, 'klinik_kunjungan');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: KunjunganBerobat[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as KunjunganBerobat);
-        });
-        items.sort((a, b) => `${b.tanggal} ${b.jam}`.localeCompare(`${a.tanggal} ${a.jam}`));
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeKunjunganBerobat:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) markQuotaExceeded();
-      console.warn("Firestore onSnapshot 'klinik_kunjungan' listener notice:", error?.message || error);
-    }
+export function subscribeKunjunganBerobat(onUpdate: (list: KunjunganBerobat[]) => void) {
+  return subscribe<KunjunganBerobat>('klinik_kunjungan', onUpdate, (a, b) =>
+    `${b.tanggal} ${b.jam}`.localeCompare(`${a.tanggal} ${a.jam}`)
   );
 }
 
-export function subscribeStokObat(
-  onUpdate: (list: StokObatLogistik[]) => void
-) {
-  const colRef = collection(db, 'klinik_stok_obat');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: StokObatLogistik[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as StokObatLogistik);
-        });
-        items.sort((a, b) => a.namaObat.localeCompare(b.namaObat));
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeStokObat:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) markQuotaExceeded();
-      console.warn("Firestore onSnapshot 'klinik_stok_obat' listener notice:", error?.message || error);
-    }
+export function subscribeStokObat(onUpdate: (list: StokObatLogistik[]) => void) {
+  return subscribe<StokObatLogistik>('klinik_stok_obat', onUpdate, (a, b) =>
+    a.namaObat.localeCompare(b.namaObat)
   );
 }
 
-export function subscribeRekamMedis(
-  onUpdate: (list: RekamMedisSantri[]) => void
-) {
-  const colRef = collection(db, 'klinik_rekam_medis');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: RekamMedisSantri[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as RekamMedisSantri);
-        });
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeRekamMedis:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) markQuotaExceeded();
-      console.warn("Firestore onSnapshot 'klinik_rekam_medis' listener notice:", error?.message || error);
-    }
+export function subscribeRekamMedis(onUpdate: (list: RekamMedisSantri[]) => void) {
+  return subscribe<RekamMedisSantri>('klinik_rekam_medis', onUpdate);
+}
+
+export function subscribeAbsensiPetugasKlinik(onUpdate: (list: AbsensiPetugasKlinik[]) => void) {
+  return subscribe<AbsensiPetugasKlinik>('klinik_absensi_petugas', onUpdate, (a, b) =>
+    b.tanggal.localeCompare(a.tanggal)
   );
 }
 
-export function subscribeAbsensiPetugasKlinik(
-  onUpdate: (list: AbsensiPetugasKlinik[]) => void
-) {
-  const colRef = collection(db, 'klinik_absensi_petugas');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: AbsensiPetugasKlinik[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as AbsensiPetugasKlinik);
-        });
-        items.sort((a, b) => b.tanggal.localeCompare(a.tanggal));
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeAbsensiPetugasKlinik:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) markQuotaExceeded();
-      console.warn("Firestore onSnapshot 'klinik_absensi_petugas' listener notice:", error?.message || error);
-    }
-  );
-}
-
-// Mutations Klinik
 export async function saveKunjunganBerobatDoc(item: KunjunganBerobat) {
   try {
-    await setDoc(doc(db, 'klinik_kunjungan', item.id), cleanData(item));
+    await saveDoc('klinik_kunjungan', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Kunjungan Berobat doc:", err);
+    console.error('Error saving Kunjungan Berobat doc:', err);
     throw err;
   }
 }
 
 export async function deleteKunjunganBerobatDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'klinik_kunjungan', id));
+    await deleteDocById('klinik_kunjungan', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting Kunjungan Berobat doc:", err);
+    console.error('Error deleting Kunjungan Berobat doc:', err);
     throw err;
   }
 }
 
 export async function saveStokObatDoc(item: StokObatLogistik) {
   try {
-    await setDoc(doc(db, 'klinik_stok_obat', item.id), cleanData(item));
+    await saveDoc('klinik_stok_obat', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Stok Obat doc:", err);
+    console.error('Error saving Stok Obat doc:', err);
     throw err;
   }
 }
 
 export async function deleteStokObatDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'klinik_stok_obat', id));
+    await deleteDocById('klinik_stok_obat', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting Stok Obat doc:", err);
+    console.error('Error deleting Stok Obat doc:', err);
     throw err;
   }
 }
 
 export async function saveRekamMedisDoc(item: RekamMedisSantri) {
   try {
-    await setDoc(doc(db, 'klinik_rekam_medis', item.idSantri), cleanData(item));
+    // Rekam medis memakai idSantri sebagai kunci dokumen.
+    await saveDoc('klinik_rekam_medis', { ...item, id: item.idSantri });
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Rekam Medis doc:", err);
+    console.error('Error saving Rekam Medis doc:', err);
     throw err;
   }
 }
 
 export async function saveAbsensiPetugasKlinikDoc(item: AbsensiPetugasKlinik) {
   try {
-    await setDoc(doc(db, 'klinik_absensi_petugas', item.id), cleanData(item));
+    await saveDoc('klinik_absensi_petugas', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Absensi Petugas Klinik doc:", err);
+    console.error('Error saving Absensi Petugas Klinik doc:', err);
     throw err;
   }
 }
 
 export async function deleteAbsensiPetugasKlinikDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'klinik_absensi_petugas', id));
+    await deleteDocById('klinik_absensi_petugas', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting Absensi Petugas Klinik doc:", err);
+    console.error('Error deleting Absensi Petugas Klinik doc:', err);
     throw err;
   }
 }
 
-// Pengguna App Management
-export function subscribePenggunaApp(
-  onUpdate: (list: PenggunaApp[]) => void
-) {
-  const colRef = collection(db, 'pengguna_app');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: PenggunaApp[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as PenggunaApp);
-        });
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribePenggunaApp:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) markQuotaExceeded();
-      console.warn("Firestore onSnapshot 'pengguna_app' listener notice:", error?.message || error);
-    }
-  );
+// ---------------------------------------------------------------------------
+// PENGGUNA APLIKASI
+// ---------------------------------------------------------------------------
+export function subscribePenggunaApp(onUpdate: (list: PenggunaApp[]) => void) {
+  return subscribe<PenggunaApp>('pengguna_app', onUpdate);
 }
 
 export async function savePenggunaAppDoc(item: PenggunaApp) {
   try {
-    await setDoc(doc(db, 'pengguna_app', item.id), cleanData(item));
+    await saveDoc('pengguna_app', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving PenggunaApp doc:", err);
+    console.error('Error saving Pengguna App doc:', err);
     throw err;
   }
 }
 
 export async function deletePenggunaAppDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'pengguna_app', id));
+    await deleteDocById('pengguna_app', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting PenggunaApp doc:", err);
+    console.error('Error deleting Pengguna App doc:', err);
     throw err;
   }
 }
 
-// LITBANG & SDM MANAGEMENT
-export function subscribeKaryawanSDM(
-  onUpdate: (list: KaryawanSDM[]) => void
-) {
-  const colRef = collection(db, 'karyawan_sdm');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: KaryawanSDM[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as KaryawanSDM);
-        });
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeKaryawanSDM:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) markQuotaExceeded();
-      console.warn("Firestore onSnapshot 'karyawan_sdm' listener notice:", error?.message || error);
-    }
-  );
+// ---------------------------------------------------------------------------
+// SDM & LITBANG
+// ---------------------------------------------------------------------------
+export function subscribeKaryawanSDM(onUpdate: (list: KaryawanSDM[]) => void) {
+  return subscribe<KaryawanSDM>('karyawan_sdm', onUpdate);
 }
 
 export async function saveKaryawanSDMDoc(item: KaryawanSDM) {
   try {
-    await setDoc(doc(db, 'karyawan_sdm', item.id), cleanData(item));
+    await saveDoc('karyawan_sdm', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving KaryawanSDM doc:", err);
+    console.error('Error saving Karyawan SDM doc:', err);
     throw err;
   }
 }
 
 export async function deleteKaryawanSDMDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'karyawan_sdm', id));
+    await deleteDocById('karyawan_sdm', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting KaryawanSDM doc:", err);
+    console.error('Error deleting Karyawan SDM doc:', err);
     throw err;
   }
 }
 
-export function subscribePenilaianSDM(
-  onUpdate: (list: PenilaianKinerjaSDM[]) => void
-) {
-  const colRef = collection(db, 'penilaian_sdm');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: PenilaianKinerjaSDM[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as PenilaianKinerjaSDM);
-        });
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribePenilaianSDM:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) markQuotaExceeded();
-      console.warn("Firestore onSnapshot 'penilaian_sdm' listener notice:", error?.message || error);
-    }
-  );
+export function subscribePenilaianSDM(onUpdate: (list: PenilaianKinerjaSDM[]) => void) {
+  return subscribe<PenilaianKinerjaSDM>('penilaian_sdm', onUpdate);
 }
 
 export async function savePenilaianSDMDoc(item: PenilaianKinerjaSDM) {
   try {
-    await setDoc(doc(db, 'penilaian_sdm', item.id), cleanData(item));
+    await saveDoc('penilaian_sdm', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving PenilaianKinerjaSDM doc:", err);
+    console.error('Error saving Penilaian SDM doc:', err);
     throw err;
   }
 }
 
 export async function deletePenilaianSDMDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'penilaian_sdm', id));
+    await deleteDocById('penilaian_sdm', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting PenilaianKinerjaSDM doc:", err);
+    console.error('Error deleting Penilaian SDM doc:', err);
     throw err;
   }
 }
 
-export function subscribeProgramLitbang(
-  onUpdate: (list: ProgramInovasiLitbang[]) => void
-) {
-  const colRef = collection(db, 'program_litbang');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: ProgramInovasiLitbang[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as ProgramInovasiLitbang);
-        });
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeProgramLitbang:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) markQuotaExceeded();
-      console.warn("Firestore onSnapshot 'program_litbang' listener notice:", error?.message || error);
-    }
-  );
+export function subscribeProgramLitbang(onUpdate: (list: ProgramInovasiLitbang[]) => void) {
+  return subscribe<ProgramInovasiLitbang>('program_litbang', onUpdate);
 }
 
 export async function saveProgramLitbangDoc(item: ProgramInovasiLitbang) {
   try {
-    await setDoc(doc(db, 'program_litbang', item.id), cleanData(item));
+    await saveDoc('program_litbang', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving ProgramInovasiLitbang doc:", err);
+    console.error('Error saving Program Litbang doc:', err);
     throw err;
   }
 }
 
 export async function deleteProgramLitbangDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'program_litbang', id));
+    await deleteDocById('program_litbang', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting ProgramInovasiLitbang doc:", err);
+    console.error('Error deleting Program Litbang doc:', err);
     throw err;
   }
 }
 
-
-
+// ---------------------------------------------------------------------------
+// PEMELIHARAAN DATA
+// ---------------------------------------------------------------------------
 export async function clearLogsInDb() {
   try {
-    const colRef = collection(db, 'logs');
-    const snapshot = await getDocs(colRef);
-    const batch = writeBatch(db);
-    snapshot.forEach((d) => {
-      batch.delete(d.ref);
-    });
-    await batch.commit();
+    await clearCollection('logs');
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error clearing logs:", err);
+    console.error('Error clearing logs:', err);
     throw err;
   }
 }
 
 export async function clearAllMutabaahRecordsInDb() {
   try {
-    const colRef = collection(db, 'mutabaah_records');
-    const snapshot = await getDocs(colRef);
-    const batch = writeBatch(db);
-    snapshot.forEach((d) => {
-      batch.delete(d.ref);
-    });
-    await batch.commit();
-    console.log("Successfully cleared all Mutabaah Yaumiyah records from Firestore.");
+    await clearCollection('mutabaah_records');
+    console.log('Seluruh catatan Mutabaah Yaumiyah berhasil dikosongkan.');
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error clearing mutabaah_records:", err);
+    console.error('Error clearing mutabaah_records:', err);
     throw err;
   }
 }
 
 export async function resetAllMutabaahRecordsOnce() {
-  if (isQuotaExceededState) return;
   try {
-    const statusRef = doc(db, 'system', 'mutabaah_reset_2026');
-    const statusSnap = await getDoc(statusRef);
-    if (!statusSnap.exists()) {
+    const status = await getSystemDoc('mutabaah_reset_2026');
+    if (!status) {
       await clearAllMutabaahRecordsInDb();
-      await setDoc(statusRef, { reset: true, timestamp: new Date().toISOString() });
-      console.log("One-time mutabaah records reset completed.");
+      await saveDoc('system', {
+        id: 'mutabaah_reset_2026',
+        reset: true,
+        timestamp: new Date().toISOString(),
+      });
+      console.log('Reset catatan mutabaah sekali jalan selesai.');
     }
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.warn("Notice: resetAllMutabaahRecordsOnce skipped / quota limit:", err);
+    console.warn('resetAllMutabaahRecordsOnce dilewati:', err);
   }
 }
 
 // ---------------------------------------------------------------------------
-// TAHFIDZ GAMIFIKASI FUNCTIONS
+// TAHFIDZ GAMIFIKASI
 // ---------------------------------------------------------------------------
-export function subscribeTahfidzSetoran(
-  onUpdate: (list: RecordSetoranTahfidz[]) => void
-) {
-  const colRef = collection(db, 'tahfidz_setoran');
-  return onSnapshot(
-    colRef,
-    (snapshot) => {
-      try {
-        const items: RecordSetoranTahfidz[] = [];
-        snapshot.forEach((d) => {
-          items.push(d.data() as RecordSetoranTahfidz);
-        });
-        items.sort((a, b) => b.tanggal.localeCompare(a.tanggal));
-        onUpdate(items);
-      } catch (err) {
-        console.error("Error inside subscribeTahfidzSetoran:", err);
-      }
-    },
-    (error) => {
-      if (checkIsQuotaError(error)) markQuotaExceeded();
-      console.warn("Firestore onSnapshot 'tahfidz_setoran' listener notice:", error?.message || error);
-    }
+export function subscribeTahfidzSetoran(onUpdate: (list: RecordSetoranTahfidz[]) => void) {
+  return subscribe<RecordSetoranTahfidz>('tahfidz_setoran', onUpdate, (a, b) =>
+    b.tanggal.localeCompare(a.tanggal)
   );
 }
 
 export async function saveTahfidzSetoranDoc(item: RecordSetoranTahfidz) {
   try {
-    await setDoc(doc(db, 'tahfidz_setoran', item.id), cleanData(item));
+    await saveDoc('tahfidz_setoran', item);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error saving Tahfidz Setoran doc:", err);
+    console.error('Error saving Tahfidz Setoran doc:', err);
     throw err;
   }
 }
 
 export async function deleteTahfidzSetoranDoc(id: string) {
   try {
-    await deleteDoc(doc(db, 'tahfidz_setoran', id));
+    await deleteDocById('tahfidz_setoran', id);
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error deleting Tahfidz Setoran doc:", err);
+    console.error('Error deleting Tahfidz Setoran doc:', err);
     throw err;
   }
 }
 
 export async function clearAllTahfidzSetoranInDb() {
   try {
-    const colRef = collection(db, 'tahfidz_setoran');
-    const snapshot = await getDocs(colRef);
-    const batch = writeBatch(db);
-    snapshot.forEach((d) => {
-      batch.delete(d.ref);
+    await clearCollection('tahfidz_setoran');
+    await saveDoc('system', {
+      id: 'tahfidz_reset_status',
+      cleared: true,
+      timestamp: new Date().toISOString(),
     });
-    await batch.commit();
-
-    const statusRef = doc(db, 'system', 'tahfidz_reset_status');
-    await setDoc(statusRef, { cleared: true, timestamp: new Date().toISOString() });
     localStorage.setItem('tahfidz_cleared', 'true');
-    console.log("Successfully cleared all Tahfidz Setoran & XP records from Firestore.");
+    console.log('Seluruh Setoran Tahfidz & XP berhasil dikosongkan.');
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.error("Error clearing tahfidz_setoran:", err);
+    console.error('Error clearing tahfidz_setoran:', err);
     throw err;
   }
 }
 
 export async function clearAllTahfidzSetoranOnce() {
-  if (isQuotaExceededState) return;
   try {
-    const statusRef = doc(db, 'system', 'tahfidz_reset_status');
-    const statusSnap = await getDoc(statusRef);
-    if (!statusSnap.exists() || !statusSnap.data()?.cleared) {
+    const status = await getSystemDoc('tahfidz_reset_status');
+    if (!status || !status.cleared) {
       await clearAllTahfidzSetoranInDb();
-      console.log("One-time tahfidz setoran clear completed.");
+      console.log('Pengosongan setoran tahfidz sekali jalan selesai.');
     }
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.warn("Notice: clearAllTahfidzSetoranOnce skipped / quota limit:", err);
+    console.warn('clearAllTahfidzSetoranOnce dilewati:', err);
   }
 }
 
 export async function seedTahfidzSetoranIfEmpty() {
-  if (isQuotaExceededState) return;
   try {
-    const statusRef = doc(db, 'system', 'tahfidz_reset_status');
-    const statusSnap = await getDoc(statusRef);
-    if (statusSnap.exists() && statusSnap.data()?.cleared) {
-      return; // Explicitly cleared by user, do not seed mock setoran
-    }
-    if (localStorage.getItem('tahfidz_cleared') === 'true') {
-      return;
-    }
+    const status = await getSystemDoc('tahfidz_reset_status');
+    if (status && status.cleared) return;
+    if (localStorage.getItem('tahfidz_cleared') === 'true') return;
 
-    const colRef = collection(db, 'tahfidz_setoran');
-    const snapshot = await getDocs(colRef);
-    if (snapshot.empty) {
-      console.log("tahfidz_setoran collection is empty. Seeding default setoran data...");
-      const batch = writeBatch(db);
-      DEFAULT_TAHFIDZ_SETORAN.forEach((item) => {
-        batch.set(doc(db, 'tahfidz_setoran', item.id), cleanData(item));
-      });
-      await batch.commit();
+    const items = await listDocs('tahfidz_setoran');
+    if (items.length === 0) {
+      console.log('tahfidz_setoran kosong. Mengisi data setoran default...');
+      await saveMany('tahfidz_setoran', DEFAULT_TAHFIDZ_SETORAN);
     }
   } catch (err) {
-    if (checkIsQuotaError(err)) markQuotaExceeded();
-    console.warn("Notice: seedTahfidzSetoranIfEmpty skipped / quota limit:", err);
+    console.warn('seedTahfidzSetoranIfEmpty dilewati:', err);
   }
 }
-

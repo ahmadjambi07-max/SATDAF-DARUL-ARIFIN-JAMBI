@@ -1,14 +1,35 @@
-# Production stack for a VPS: the SATDAF app + Caddy (automatic HTTPS).
+# Production stack for a VPS: SATDAF app + PostgreSQL + Caddy (automatic HTTPS).
 # Usage: docker compose -f docker-compose.prod.yml up -d --build
-# Variables come from .env next to this file (DOMAIN, GEMINI_API_KEY).
+# Variables come from .env next to this file (DOMAIN, POSTGRES_PASSWORD, GEMINI_API_KEY).
 
 services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=satdaf
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD di .env}
+      - POSTGRES_DB=satdaf
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U satdaf -d satdaf
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   app:
     build:
       context: .
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       - NODE_ENV=production
+      - DATABASE_URL=postgres://satdaf:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD di .env}@db:5432/satdaf
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - APP_URL=${APP_URL:-}
     expose:
@@ -40,5 +61,6 @@ services:
       - caddy_config:/config
 
 volumes:
+  db_data:
   caddy_data:
   caddy_config:

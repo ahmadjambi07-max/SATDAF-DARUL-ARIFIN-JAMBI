@@ -3,6 +3,8 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import { initDb } from "./server/db";
+import { storageRouter } from "./server/storage";
 
 dotenv.config();
 
@@ -11,6 +13,9 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(express.json({ limit: "15mb" }));
+
+  // Penyimpanan aplikasi (PostgreSQL): REST + realtime untuk semua koleksi data.
+  app.use("/api", storageRouter);
 
   // API Health Endpoint
   app.get("/api/health", (req, res) => {
@@ -122,6 +127,12 @@ Aturan Gaya Bahasa & Respon:
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
+  }
+
+  try {
+    await initDb();
+  } catch (err) {
+    console.error("[db] inisialisasi gagal:", (err as Error).message);
   }
 
   app.listen(PORT, "0.0.0.0", () => {

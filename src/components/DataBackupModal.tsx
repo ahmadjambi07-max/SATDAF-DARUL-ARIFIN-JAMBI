@@ -3,7 +3,6 @@ import {
   Database, 
   Download, 
   Upload, 
-  ExternalLink, 
   ShieldCheck, 
   AlertTriangle, 
   CheckCircle2, 
@@ -105,7 +104,7 @@ export default function DataBackupModal({
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       try {
         const parsed = JSON.parse(event.target?.result as string);
         if (!parsed.data && typeof parsed !== 'object') {
@@ -113,6 +112,17 @@ export default function DataBackupModal({
         }
 
         const dataObj = parsed.data || parsed;
+
+        // Tulis dulu ke database PostgreSQL di server, baru ke cache lokal.
+        const response = await fetch('/api/storage/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: dataObj })
+        });
+        if (!response.ok) {
+          throw new Error(`Server menolak impor (${response.status})`);
+        }
+
         Object.keys(dataObj).forEach(key => {
           if (key.startsWith('satdaf_')) {
             localStorage.setItem(key, JSON.stringify(dataObj[key]));
@@ -145,7 +155,7 @@ export default function DataBackupModal({
             </div>
             <div>
               <h3 className="font-bold text-lg text-white">Status & Cadangan Data Sistem</h3>
-              <p className="text-xs text-slate-400">Pengecekan Firebase Firestore & Manajemen Cadangan Data</p>
+              <p className="text-xs text-slate-400">Pengecekan Database PostgreSQL & Manajemen Cadangan Data</p>
             </div>
           </div>
           <button
@@ -161,22 +171,11 @@ export default function DataBackupModal({
           <div className="p-4 bg-emerald-950/40 border border-emerald-800/60 rounded-xl space-y-2">
             <div className="flex items-center gap-2 text-emerald-400 font-bold text-sm">
               <ShieldCheck className="w-4 h-4" />
-              <span>Data Firebase Firestore Tersimpan Aman</span>
+              <span>Data Tersimpan di Database PostgreSQL Sendiri</span>
             </div>
             <p className="text-xs text-slate-300 leading-relaxed">
-              Seluruh data inputan yang Anda masukkan tetap tersimpan di server Google Cloud Firebase dan sinkron dengan penyimpanan cache lokal peramban Anda.
+              Seluruh data inputan tersimpan di database PostgreSQL pada server Anda sendiri dan disinkronkan real-time ke setiap perangkat, dengan cadangan lokal di peramban.
             </p>
-            <div className="pt-2">
-              <a
-                href="https://console.firebase.google.com/project/dulcet-day-2s7sz/firestore/databases/ai-studio-satdafsistemadmi-0afc1d6c-be3f-4056-a560-9b01eb2d1255/data?openUpgradeDialog=true"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 text-xs font-bold text-nature-gold hover:underline"
-              >
-                <span>Buka & Periksa Database di Firebase Console</span>
-                <ExternalLink className="w-3.5 h-3.5" />
-              </a>
-            </div>
           </div>
 
           {/* Current Stats Overview */}
