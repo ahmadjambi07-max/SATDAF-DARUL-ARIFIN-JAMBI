@@ -1,6 +1,10 @@
-import { initializeApp } from 'firebase/app';
+import { initializeApp, getApps, getApp } from 'firebase/app';
 import { 
   getFirestore, 
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  CACHE_SIZE_UNLIMITED,
   collection, 
   doc, 
   setDoc, 
@@ -44,9 +48,25 @@ const firebaseConfig = {
   appId: "1:620463839495:web:3d4d0fd5d675bf4273cda2"
 };
 
-const app = initializeApp(firebaseConfig);
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 const databaseId = "ai-studio-satdafsistemadmi-0afc1d6c-be3f-4056-a560-9b01eb2d1255";
-export const db = getFirestore(app, databaseId);
+
+// Initialize Firestore with IndexedDB Offline Persistence and Multi-Tab Synchronization
+let firestoreInstance;
+try {
+  firestoreInstance = initializeFirestore(app, {
+    localCache: persistentLocalCache({
+      tabManager: persistentMultipleTabManager(),
+      cacheSizeBytes: CACHE_SIZE_UNLIMITED
+    })
+  }, databaseId);
+  console.log("✅ Firestore Offline Caching (IndexedDB Persistence) aktif dan siap digunakan.");
+} catch (e) {
+  console.warn("⚠️ Fallback to standard Firestore instance:", e);
+  firestoreInstance = getFirestore(app, databaseId);
+}
+
+export const db = firestoreInstance;
 
 // Helper to strip undefined values so Firestore does not throw invalid data errors
 function cleanData<T>(item: T): T {
